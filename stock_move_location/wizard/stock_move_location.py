@@ -3,6 +3,8 @@
 # Copyright 2019 Sergio Teruel - Tecnativa <sergio.teruel@tecnativa.com>
 # License AGPL-3.0 or later (http://www.gnu.org/licenses/agpl)
 
+from itertools import groupby
+
 from odoo import api, fields, models
 from odoo.fields import first
 
@@ -82,24 +84,58 @@ class StockMoveLocationWizard(models.TransientModel):
         quants = self.env["stock.quant"].browse(
             self.env.context.get("active_ids", False)
         )
-        res["stock_move_location_line_ids"] = [
-            (
-                0,
-                0,
-                {
-                    "product_id": quant.product_id.id,
-                    "move_quantity": quant.quantity,
-                    "max_quantity": quant.quantity,
-                    "reserved_quantity": quant.reserved_quantity,
-                    "origin_location_id": quant.location_id.id,
-                    "lot_id": quant.lot_id.id,
-                    "product_uom_id": quant.product_uom_id.id,
-                    "custom": False,
-                },
-            )
-            for quant in quants
-        ]
+        res["stock_move_location_line_ids"] = self._prepare_wizard_move_lines(quants)
         res["origin_location_id"] = first(quants).location_id.id
+        return res
+
+    @api.model
+    def _prepare_wizard_move_lines(self, quants):
+        res = []
+        exclude_reserved_qty = self.env.context.get("only_reserved_qty", False)
+        if not exclude_reserved_qty:
+            res = [
+                (
+                    0,
+                    0,
+                    {
+                        "product_id": quant.product_id.id,
+                        "move_quantity": quant.quantity,
+                        "max_quantity": quant.quantity,
+                        "reserved_quantity": quant.reserved_quantity,
+                        "origin_location_id": quant.location_id.id,
+                        "lot_id": quant.lot_id.id,
+                        "product_uom_id": quant.product_uom_id.id,
+                        "custom": False,
+                    },
+                )
+                for quant in quants
+            ]
+        else:
+            # if need move only available qty per product on location
+            for _product, quant in groupby(quants, lambda r: r.product_id):
+                # we need only one quant per product
+                quant = list(quant)[0]
+                qty = quant._get_available_quantity(
+                    quant.product_id,
+                    quant.location_id,
+                )
+                if qty:
+                    res.append(
+                        (
+                            0,
+                            0,
+                            {
+                                "product_id": quant.product_id.id,
+                                "move_quantity": qty,
+                                "max_quantity": qty,
+                                "reserved_quantity": quant.reserved_quantity,
+                                "origin_location_id": quant.location_id.id,
+                                "lot_id": quant.lot_id.id,
+                                "product_uom_id": quant.product_uom_id.id,
+                                "custom": False,
+                            },
+                        )
+                    )
         return res
 
     @api.onchange("origin_location_id")
@@ -209,7 +245,10 @@ class StockMoveLocationWizard(models.TransientModel):
 
     def action_move_location(self):
         self.ensure_one()
-        picking = self._create_picking()
+        if not self.picking_id:
+            picking = self._create_picking()
+        else:
+            picking = self.picking_id
         self._create_moves(picking)
         if not self.env.context.get("planned"):
             moves_to_reassign = self._unreserve_moves()
@@ -221,11 +260,13 @@ class StockMoveLocationWizard(models.TransientModel):
         self.picking_id = picking
         return self._get_picking_action(picking.id)
 
-    def _get_picking_action(self, pickinig_id):
-        action = self.env.ref("stock.action_picking_tree_all").read()[0]
+    def _get_picking_action(self, picking_id):
+        action = self.env["ir.actions.act_window"]._for_xml_id(
+            "stock.action_picking_tree_all"
+        )
         form_view = self.env.ref("stock.view_picking_form").id
         action.update(
-            {"view_mode": "form", "views": [(form_view, "form")], "res_id": pickinig_id}
+            {"view_mode": "form", "views": [(form_view, "form")], "res_id": picking_id}
         )
         return action
 
